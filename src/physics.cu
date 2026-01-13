@@ -7,7 +7,6 @@ __device__ int computeGridHash(float x, float y, int gridWidth, int gridHeight)
     int cellX = (int)(x / CELL_SIZE);
     int cellY = (int)(y / CELL_SIZE);
 
-    // Clamp to grid bounds
     cellX = max(0, min(cellX, gridWidth - 1));
     cellY = max(0, min(cellY, gridHeight - 1));
 
@@ -121,7 +120,12 @@ __global__ void handleCollisionsGridKernel(
     float r1 = radius[originalIdx];
     float m1 = mass[originalIdx];
 
-    // Get particle's grid cell
+    float xdisp = 0.0f;
+    float ydisp = 0.0f;
+    float xspd = 0.0f;
+    float yspd = 0.0f;
+    int colcount = 0;
+
     int cellX = (int)(x1 / CELL_SIZE);
     int cellY = (int)(y1 / CELL_SIZE);
 
@@ -133,7 +137,6 @@ __global__ void handleCollisionsGridKernel(
             int neighborX = cellX + dx;
             int neighborY = cellY + dy;
 
-            // Check bounds
             if (neighborX < 0 || neighborX >= gridWidth ||
                 neighborY < 0 || neighborY >= gridHeight)
                 continue;
@@ -169,28 +172,27 @@ __global__ void handleCollisionsGridKernel(
                     if (dvn <= 0)
                         continue;
 
-                    // Elastic collision response
                     float m2 = mass[otherIdx];
                     float impulse = DAMPING * 2.0f * dvn / (m1 + m2);
 
-                    vx1 -= impulse * m2 * nx;
-                    vy1 -= impulse * m2 * ny;
+                    xspd += impulse * m2 * nx;
+                    yspd += impulse * m2 * ny;
 
-                    // Separate particles to avoid overlap
                     float overlap = minDist - dist;
-                    float separation = overlap * 0.75f;
-                    x1 -= separation * nx;
-                    y1 -= separation * ny;
+                    float separation = overlap;
+                    xdisp += separation * nx;
+                    ydisp += separation * ny;
+
+                    colcount++;
                 }
             }
         }
     }
-
-    // Write back updated values
-    x[originalIdx] = x1;
-    y[originalIdx] = y1;
-    vx[originalIdx] = vx1;
-    vy[originalIdx] = vy1;
+    float avg = colcount > 1 ? 2.0f / colcount : 1.0f;
+    x[originalIdx] -= xdisp * avg;
+    y[originalIdx] -= ydisp * avg;
+    vx[originalIdx] -= xspd * avg;
+    vy[originalIdx] -= yspd * avg;
 }
 
 // CUDA kernel to copy SoA data to interleaved VBO format
@@ -255,7 +257,6 @@ void PhysicsSimulator::allocateDeviceMemory()
     cudaMalloc(&d_particles.radius, size);
     cudaMalloc(&d_particles.mass, size);
 
-    // Allocate spatial grid
     cudaMalloc(&d_grid.cellStart, totalCells * sizeof(int));
     cudaMalloc(&d_grid.cellEnd, totalCells * sizeof(int));
     cudaMalloc(&d_grid.particleHash, NUM_PARTICLES * sizeof(int));
@@ -311,7 +312,6 @@ void PhysicsSimulator::updateWorldSize(int width, int height)
 
     if (totalCells != oldTotalCells)
     {
-        // Reallocate grid buffers
         cudaFree(d_grid.cellStart);
         cudaFree(d_grid.cellEnd);
         cudaMalloc(&d_grid.cellStart, totalCells * sizeof(int));
@@ -335,6 +335,7 @@ void PhysicsSimulator::update(float dt, int windowWidth, int windowHeight)
         d_particles.x, d_particles.y, d_particles.vx, d_particles.vy,
         d_particles.radius, NUM_PARTICLES, dt, currentWidth, currentHeight);
     cudaDeviceSynchronize();
+
     // Spatial grid collision detection
     // 1. Compute hashes
     computeHashKernel<<<blocks, threadsPerBlock>>>(
@@ -402,46 +403,35 @@ void PhysicsSimulator::initializeParticles(int windowWidth, int windowHeight)
     std::vector<float> h_radius(NUM_PARTICLES);
     std::vector<float> h_mass(NUM_PARTICLES);
 
-    // --- Triangle geometry ---
-    const float side = static_cast<float>(windowWidth);
-    const float height = side * std::sqrt(3.0f) * 0.5f;
+    // --- Circle geometry ---
+    const float centerX = windowWidth * 0.4f;
+    const float centerY = windowHeight * 0.4f;
 
-    // Scale triangle vertically if it does not fit in window
-    const float yScale = (height > windowHeight)
-                             ? (static_cast<float>(windowHeight) / height)
-                             : 1.0f;
+    // Radius chosen to fit entirely in window
+    const float circleRadius = 0.45f * std::min(windowWidth, windowHeight);
 
-    const float spacing = std::sqrt((side * height) / NUM_PARTICLES);
-    int index = 0;
+    // --- Particle placement ---
+    std::uniform_real_distribution<float> angleDist(0.0f, 2.0f * static_cast<float>(M_PI));
+    std::uniform_real_distribution<float> radiusNormDist(0.0f, 1.0f);
 
-    for (float y = 0.0f; y <= height && index < NUM_PARTICLES; y += spacing)
+    for (int index = 0; index < NUM_PARTICLES; ++index)
     {
-        float rowWidth = side * (1.0f - y / height);
-        float startX = (side - rowWidth) * 0.5f;
+        // Uniform distribution inside circle
+        float theta = angleDist(rng);
+        float r = circleRadius * std::sqrt(radiusNormDist(rng));
 
-        int particlesInRow = static_cast<int>(rowWidth / spacing);
-        if (particlesInRow < 1)
-            particlesInRow = 1;
+        h_x[index] = centerX + r * std::cos(theta);
+        h_y[index] = centerY + r * std::sin(theta);
 
-        float dx = rowWidth / particlesInRow;
+        h_vx[index] = velXDist(rng);
+        h_vy[index] = velYDist(rng);
 
-        for (int j = 0; j < particlesInRow && index < NUM_PARTICLES; ++j)
-        {
-            h_x[index] = startX + j * dx;
-            h_y[index] = y * yScale;
+        h_radius[index] = radiusDist(rng);
+        h_mass[index] = h_radius[index] * h_radius[index];
 
-            h_vx[index] = velXDist(rng);
-            h_vy[index] = velYDist(rng);
-
-            h_radius[index] = radiusDist(rng);
-            h_mass[index] = h_radius[index] * h_radius[index];
-
-            h_r[index] = colorDist(rng);
-            h_g[index] = colorDist(rng);
-            h_b[index] = colorDist(rng);
-
-            ++index;
-        }
+        h_r[index] = colorDist(rng);
+        h_g[index] = colorDist(rng);
+        h_b[index] = colorDist(rng);
     }
 
     // --- Upload to device ---

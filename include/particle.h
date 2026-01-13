@@ -30,7 +30,7 @@ struct SpatialGrid {
 };
 
 // Constants
-const int NUM_PARTICLES = 100000;
+const int NUM_PARTICLES = 150000;
 const int INITIAL_WINDOW_WIDTH = 2100;
 const int INITIAL_WINDOW_HEIGHT = 1400;
 const float GRAVITY = 980.0f;
