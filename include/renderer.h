@@ -16,30 +16,26 @@ public:
 
     GLFWwindow *getWindow() { return window; }
     unsigned int getVBO() { return vbo; }
-
-    void getWindowSize(int &height, int &width);
+    void getWindowSize(int *width, int *height);
 
     void render();
     bool shouldClose();
 
-    void updateProjection(int width, int height);
-    
-    int winWidth = 0;
-    int winHeight = 0;
-
 private:
-
-    double lastFpsTime = 0.0;
-    int frameCount = 0;
-
-
     GLFWwindow *window;
     unsigned int vao;
     unsigned int vbo;
     unsigned int shaderProgram;
+    int windowWidth;
+    int windowHeight;
+    double lastFpsTime = 0.0;
+    int frameCount = 0;
 
     bool createShaders();
     void setupBuffers();
+    void updateProjectionMatrix(int width, int height);
+
+    static void framebufferSizeCallback(GLFWwindow *window, int width, int height);
 };
 
 #endif

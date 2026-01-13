@@ -1,105 +1,226 @@
 #include "physics.cuh"
-#include <cstdlib>
-#include <ctime>
-#include <cstdio>
-#include <GLES2/gl2.h>
+#include <algorithm>
 
-// CUDA kernel for physics update
-__global__ void updatePhysicsKernel(Particle *particles, int n, float dt, int width, int height)
+// Compute grid hash for a particle
+__device__ int computeGridHash(float x, float y, int gridWidth, int gridHeight)
+{
+    int cellX = (int)(x / CELL_SIZE);
+    int cellY = (int)(y / CELL_SIZE);
+
+    // Clamp to grid bounds
+    cellX = max(0, min(cellX, gridWidth - 1));
+    cellY = max(0, min(cellY, gridHeight - 1));
+
+    return cellY * gridWidth + cellX;
+}
+
+// CUDA kernel to compute particle hashes
+__global__ void computeHashKernel(
+    int *particleHash, int *particleIndex,
+    float *x, float *y, int n, int gridWidth, int gridHeight)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n)
         return;
 
-    Particle &p = particles[idx];
+    particleHash[idx] = computeGridHash(x[idx], y[idx], gridWidth, gridHeight);
+    particleIndex[idx] = idx;
+}
 
-    // Apply gravity
-    p.vy += GRAVITY * dt;
+// CUDA kernel to find cell boundaries after sorting
+__global__ void findCellBoundariesKernel(
+    int *cellStart,
+    int *cellEnd,
+    const int *particleHash,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n)
+        return;
 
-    // Update position
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
+    int hash = particleHash[idx];
 
-    // Wall collisions with damping
-    if (p.x - p.radius < 0)
+    if (idx == 0)
     {
-        p.x = p.radius;
-        p.vx = -p.vx * DAMPING;
+        cellStart[hash] = 0;
     }
-    if (p.x + p.radius > width)
+    else
     {
-        p.x = width - p.radius;
-        p.vx = -p.vx * DAMPING;
+        int prevHash = particleHash[idx - 1];
+        if (prevHash != hash)
+        {
+            cellStart[hash] = idx;
+            cellEnd[prevHash] = idx;
+        }
     }
-    if (p.y - p.radius < 0)
+
+    if (idx == n - 1)
     {
-        p.y = p.radius;
-        p.vy = -p.vy * DAMPING;
-    }
-    if (p.y + p.radius > height)
-    {
-        p.y = height - p.radius;
-        p.vy = -p.vy * DAMPING;
+        cellEnd[hash] = n;
     }
 }
 
-// CUDA kernel for particle-particle collisions
-__global__ void handleCollisionsKernel(Particle *particles, int n)
+// CUDA kernel for physics update using Structure of Arrays
+__global__ void updatePhysicsKernel(
+    float *x, float *y, float *vx, float *vy,
+    float *radius, int n, float dt, int width, int height)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n)
         return;
 
-    Particle &p1 = particles[idx];
+    // Apply gravity
+    vy[idx] += GRAVITY * dt;
 
-    for (int i = 0; i < n; i++)
+    // Update position
+    x[idx] += vx[idx] * dt;
+    y[idx] += vy[idx] * dt;
+
+    // Wall collisions with damping
+    float r = radius[idx];
+
+    if (x[idx] - r < 0)
     {
-        if (i == idx)
-            continue;
+        x[idx] = r;
+        vx[idx] = -vx[idx] * DAMPING;
+    }
+    if (x[idx] + r > width)
+    {
+        x[idx] = width - r;
+        vx[idx] = -vx[idx] * DAMPING;
+    }
+    if (y[idx] - r < 0)
+    {
+        y[idx] = r;
+        vy[idx] = -vy[idx] * DAMPING;
+    }
+    if (y[idx] + r > height)
+    {
+        y[idx] = height - r;
+        vy[idx] = -vy[idx] * DAMPING;
+    }
+}
 
-        Particle &p2 = particles[i];
+// CUDA kernel for particle-particle collisions using spatial grid
+__global__ void handleCollisionsGridKernel(
+    float *x, float *y, float *vx, float *vy,
+    float *radius, float *mass,
+    int *cellStart, int *cellEnd, int *particleHash, int *particleIndex,
+    int n, int gridWidth, int gridHeight)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n)
+        return;
 
-        float dx = p2.x - p1.x;
-        float dy = p2.y - p1.y;
-        float dist = sqrtf(dx * dx + dy * dy);
-        float minDist = p1.radius + p2.radius;
+    int originalIdx = particleIndex[idx];
 
-        if (dist < minDist && dist > 0.1f)
+    float x1 = x[originalIdx];
+    float y1 = y[originalIdx];
+    float vx1 = vx[originalIdx];
+    float vy1 = vy[originalIdx];
+    float r1 = radius[originalIdx];
+    float m1 = mass[originalIdx];
+
+    // Get particle's grid cell
+    int cellX = (int)(x1 / CELL_SIZE);
+    int cellY = (int)(y1 / CELL_SIZE);
+
+    // Check 3x3 neighboring cells
+    for (int dy = -1; dy <= 1; dy++)
+    {
+        for (int dx = -1; dx <= 1; dx++)
         {
-            // Normalize collision vector
-            float nx = dx / dist;
-            float ny = dy / dist;
+            int neighborX = cellX + dx;
+            int neighborY = cellY + dy;
 
-            // Relative velocity
-            float dvx = p1.vx - p2.vx;
-            float dvy = p1.vy - p2.vy;
-            float dvn = dvx * nx + dvy * ny;
-
-            // Don't process if particles are separating
-            if (dvn < 0)
+            // Check bounds
+            if (neighborX < 0 || neighborX >= gridWidth ||
+                neighborY < 0 || neighborY >= gridHeight)
                 continue;
 
-            // Elastic collision response
-            float m1 = p1.mass;
-            float m2 = p2.mass;
-            float impulse = DAMPING * 2.0f * dvn / (m1 + m2);
+            int neighborCell = neighborY * gridWidth + neighborX;
+            int start = cellStart[neighborCell];
+            int end = cellEnd[neighborCell];
 
-            p1.vx -= impulse * m2 * nx;
-            p1.vy -= impulse * m2 * ny;
+            // Check all particles in this cell
+            for (int j = start; j < end; j++)
+            {
+                int otherIdx = particleIndex[j];
+                if (otherIdx == originalIdx)
+                    continue;
 
-            // Separate particles to avoid overlap
-            float overlap = minDist - dist;
-            float separation = overlap / 2.0f;
-            p1.x -= separation * nx;
-            p1.y -= separation * ny;
+                float dx_dist = x[otherIdx] - x1;
+                float dy_dist = y[otherIdx] - y1;
+                float dist = sqrtf(dx_dist * dx_dist + dy_dist * dy_dist);
+                float minDist = r1 + radius[otherIdx];
+
+                if (dist < minDist && dist > 1e-6f)
+                {
+                    // Normalize collision vector
+                    float nx = dx_dist / dist;
+                    float ny = dy_dist / dist;
+
+                    // Relative velocity
+                    float dvx_rel = vx1 - vx[otherIdx];
+                    float dvy_rel = vy1 - vy[otherIdx];
+                    float dvn = dvx_rel * nx + dvy_rel * ny;
+
+                    // Don't process if particles are separating
+                    if (dvn <= 0)
+                        continue;
+
+                    // Elastic collision response
+                    float m2 = mass[otherIdx];
+                    float impulse = DAMPING * 2.0f * dvn / (m1 + m2);
+
+                    vx1 -= impulse * m2 * nx;
+                    vy1 -= impulse * m2 * ny;
+
+                    // Separate particles to avoid overlap
+                    float overlap = minDist - dist;
+                    float separation = overlap * 0.75f;
+                    x1 -= separation * nx;
+                    y1 -= separation * ny;
+                }
+            }
         }
     }
+
+    // Write back updated values
+    x[originalIdx] = x1;
+    y[originalIdx] = y1;
+    vx[originalIdx] = vx1;
+    vy[originalIdx] = vy1;
+}
+
+// CUDA kernel to copy SoA data to interleaved VBO format
+__global__ void copyToVBOKernel(
+    ParticleVertex *vbo,
+    float *x, float *y, float *r, float *g, float *b, float *radius,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n)
+        return;
+
+    vbo[idx].x = x[idx];
+    vbo[idx].y = y[idx];
+    vbo[idx].r = r[idx];
+    vbo[idx].g = g[idx];
+    vbo[idx].b = b[idx];
+    vbo[idx].radius = radius[idx];
 }
 
 PhysicsSimulator::PhysicsSimulator()
-    : cudaVboResource(nullptr), threadsPerBlock(256)
+    : cudaVboResource(nullptr), threadsPerBlock(256),
+      currentWidth(INITIAL_WINDOW_WIDTH), currentHeight(INITIAL_WINDOW_HEIGHT)
 {
     blocks = (NUM_PARTICLES + threadsPerBlock - 1) / threadsPerBlock;
+    d_particles = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    d_grid = {nullptr, nullptr, nullptr, nullptr};
+
+    updateGridDimensions(currentWidth, currentHeight);
+    allocateDeviceMemory();
 }
 
 PhysicsSimulator::~PhysicsSimulator()
@@ -108,6 +229,55 @@ PhysicsSimulator::~PhysicsSimulator()
     {
         unregisterVBO();
     }
+    freeDeviceMemory();
+}
+
+void PhysicsSimulator::updateGridDimensions(int width, int height)
+{
+    gridWidth = (int)ceilf(width / CELL_SIZE);
+    gridHeight = (int)ceilf(height / CELL_SIZE);
+    totalCells = gridWidth * gridHeight;
+
+    printf("Grid dimensions: %dx%d = %d cells (window: %dx%d)\n",
+           gridWidth, gridHeight, totalCells, width, height);
+}
+
+void PhysicsSimulator::allocateDeviceMemory()
+{
+    size_t size = NUM_PARTICLES * sizeof(float);
+    cudaMalloc(&d_particles.x, size);
+    cudaMalloc(&d_particles.y, size);
+    cudaMalloc(&d_particles.vx, size);
+    cudaMalloc(&d_particles.vy, size);
+    cudaMalloc(&d_particles.r, size);
+    cudaMalloc(&d_particles.g, size);
+    cudaMalloc(&d_particles.b, size);
+    cudaMalloc(&d_particles.radius, size);
+    cudaMalloc(&d_particles.mass, size);
+
+    // Allocate spatial grid
+    cudaMalloc(&d_grid.cellStart, totalCells * sizeof(int));
+    cudaMalloc(&d_grid.cellEnd, totalCells * sizeof(int));
+    cudaMalloc(&d_grid.particleHash, NUM_PARTICLES * sizeof(int));
+    cudaMalloc(&d_grid.particleIndex, NUM_PARTICLES * sizeof(int));
+}
+
+void PhysicsSimulator::freeDeviceMemory()
+{
+    cudaFree(d_particles.x);
+    cudaFree(d_particles.y);
+    cudaFree(d_particles.vx);
+    cudaFree(d_particles.vy);
+    cudaFree(d_particles.r);
+    cudaFree(d_particles.g);
+    cudaFree(d_particles.b);
+    cudaFree(d_particles.radius);
+    cudaFree(d_particles.mass);
+
+    cudaFree(d_grid.cellStart);
+    cudaFree(d_grid.cellEnd);
+    cudaFree(d_grid.particleHash);
+    cudaFree(d_grid.particleIndex);
 }
 
 void PhysicsSimulator::registerVBO(unsigned int vbo)
@@ -124,57 +294,165 @@ void PhysicsSimulator::unregisterVBO()
     }
 }
 
-void PhysicsSimulator::update(float dt, int width, int height)
+void PhysicsSimulator::updateWorldSize(int width, int height)
+{
+    if (width == currentWidth && height == currentHeight)
+        return;
+
+    printf("Physics world size updated: %dx%d -> %dx%d\n",
+           currentWidth, currentHeight, width, height);
+
+    currentWidth = width;
+    currentHeight = height;
+
+    // Update grid dimensions and reallocate if needed
+    int oldTotalCells = totalCells;
+    updateGridDimensions(width, height);
+
+    if (totalCells != oldTotalCells)
+    {
+        // Reallocate grid buffers
+        cudaFree(d_grid.cellStart);
+        cudaFree(d_grid.cellEnd);
+        cudaMalloc(&d_grid.cellStart, totalCells * sizeof(int));
+        cudaMalloc(&d_grid.cellEnd, totalCells * sizeof(int));
+    }
+}
+
+void PhysicsSimulator::update(float dt, int windowWidth, int windowHeight)
 {
     if (!cudaVboResource)
         return;
 
-    // Map VBO to CUDA
-    cudaGraphicsMapResources(1, &cudaVboResource, 0);
-    Particle *d_particles;
-    size_t num_bytes;
-    cudaGraphicsResourceGetMappedPointer((void **)&d_particles, &num_bytes, cudaVboResource);
+    // Check if world size changed
+    if (windowWidth != currentWidth || windowHeight != currentHeight)
+    {
+        updateWorldSize(windowWidth, windowHeight);
+    }
 
-    // Run physics kernels
+    // Run physics on SoA data
     updatePhysicsKernel<<<blocks, threadsPerBlock>>>(
-        d_particles, NUM_PARTICLES, dt, width, height);
-    handleCollisionsKernel<<<blocks, threadsPerBlock>>>(d_particles, NUM_PARTICLES);
+        d_particles.x, d_particles.y, d_particles.vx, d_particles.vy,
+        d_particles.radius, NUM_PARTICLES, dt, currentWidth, currentHeight);
+    cudaDeviceSynchronize();
+    // Spatial grid collision detection
+    // 1. Compute hashes
+    computeHashKernel<<<blocks, threadsPerBlock>>>(
+        d_grid.particleHash, d_grid.particleIndex,
+        d_particles.x, d_particles.y, NUM_PARTICLES, gridWidth, gridHeight);
+
+    // 2. Sort particles by hash using Thrust
+    thrust::device_ptr<int> hash_ptr(d_grid.particleHash);
+    thrust::device_ptr<int> index_ptr(d_grid.particleIndex);
+    thrust::sort_by_key(hash_ptr, hash_ptr + NUM_PARTICLES, index_ptr);
+
+    // 3. Initialize cell boundaries to empty
+    cudaMemset(d_grid.cellStart, 0xFF, totalCells * sizeof(int));
+    cudaMemset(d_grid.cellEnd, 0, totalCells * sizeof(int));
+
+    // 4. Find cell boundaries
+    findCellBoundariesKernel<<<blocks, threadsPerBlock>>>(
+        d_grid.cellStart, d_grid.cellEnd, d_grid.particleHash,
+        NUM_PARTICLES);
+
+    // 5. Handle collisions using grid
+    handleCollisionsGridKernel<<<blocks, threadsPerBlock>>>(
+        d_particles.x, d_particles.y, d_particles.vx, d_particles.vy,
+        d_particles.radius, d_particles.mass,
+        d_grid.cellStart, d_grid.cellEnd, d_grid.particleHash, d_grid.particleIndex,
+        NUM_PARTICLES, gridWidth, gridHeight);
+
+    // Map VBO and copy data to it
+    cudaGraphicsMapResources(1, &cudaVboResource, 0);
+    ParticleVertex *d_vbo;
+    size_t num_bytes;
+    cudaGraphicsResourceGetMappedPointer((void **)&d_vbo, &num_bytes, cudaVboResource);
+
+    // Copy SoA to interleaved VBO format
+    copyToVBOKernel<<<blocks, threadsPerBlock>>>(
+        d_vbo, d_particles.x, d_particles.y,
+        d_particles.r, d_particles.g, d_particles.b, d_particles.radius,
+        NUM_PARTICLES);
 
     cudaDeviceSynchronize();
-
-    // Unmap VBO
     cudaGraphicsUnmapResources(1, &cudaVboResource, 0);
 }
 
-void PhysicsSimulator::initializeParticles() {
-    srand(time(NULL));
-    Particle* h_particles = new Particle[NUM_PARTICLES];
+void PhysicsSimulator::initializeParticles(int windowWidth, int windowHeight)
+{
+    currentWidth = windowWidth;
+    currentHeight = windowHeight;
+    updateGridDimensions(windowWidth, windowHeight);
 
-    float cx = WINDOW_WIDTH * 0.5f;
-    float cy = WINDOW_HEIGHT * 0.5f;
-    float radius = WINDOW_HEIGHT * 0.3f;
+    // --- Random engine ---
+    std::mt19937 rng(static_cast<unsigned int>(time(nullptr)));
+    std::uniform_real_distribution<float> velXDist(-100.0f, 100.0f);
+    std::uniform_real_distribution<float> velYDist(0.0f, 100.0f);
+    std::uniform_real_distribution<float> colorDist(0.0f, 1.0f);
+    std::uniform_real_distribution<float> radiusDist(MIN_RADIUS, MAX_RADIUS);
 
-    for (int i = 0; i < NUM_PARTICLES; i++) {
-        float t = static_cast<float>(i) / NUM_PARTICLES;
-        float angle = t * 2.0f * 3.1415926f;
+    // --- Host buffers ---
+    std::vector<float> h_x(NUM_PARTICLES);
+    std::vector<float> h_y(NUM_PARTICLES);
+    std::vector<float> h_vx(NUM_PARTICLES);
+    std::vector<float> h_vy(NUM_PARTICLES);
+    std::vector<float> h_r(NUM_PARTICLES);
+    std::vector<float> h_g(NUM_PARTICLES);
+    std::vector<float> h_b(NUM_PARTICLES);
+    std::vector<float> h_radius(NUM_PARTICLES);
+    std::vector<float> h_mass(NUM_PARTICLES);
 
-        h_particles[i].x = cx + radius * cosf(angle);
-        h_particles[i].y = cy + radius * sinf(angle);
+    // --- Triangle geometry ---
+    const float side = static_cast<float>(windowWidth);
+    const float height = side * std::sqrt(3.0f) * 0.5f;
 
-        h_particles[i].vx = (rand() % 200 - 100);
-        h_particles[i].vy = (rand() % 100);
+    // Scale triangle vertically if it does not fit in window
+    const float yScale = (height > windowHeight)
+                             ? (static_cast<float>(windowHeight) / height)
+                             : 1.0f;
 
-        h_particles[i].radius =
-            MIN_RADIUS + (rand() % 100) / 100.0f * (MAX_RADIUS - MIN_RADIUS);
-        h_particles[i].mass = h_particles[i].radius * h_particles[i].radius;
+    const float spacing = std::sqrt((side * height) / NUM_PARTICLES);
+    int index = 0;
 
-        h_particles[i].r = (rand() % 100) / 100.0f;
-        h_particles[i].g = (rand() % 100) / 100.0f;
-        h_particles[i].b = (rand() % 100) / 100.0f;
+    for (float y = 0.0f; y <= height && index < NUM_PARTICLES; y += spacing)
+    {
+        float rowWidth = side * (1.0f - y / height);
+        float startX = (side - rowWidth) * 0.5f;
+
+        int particlesInRow = static_cast<int>(rowWidth / spacing);
+        if (particlesInRow < 1)
+            particlesInRow = 1;
+
+        float dx = rowWidth / particlesInRow;
+
+        for (int j = 0; j < particlesInRow && index < NUM_PARTICLES; ++j)
+        {
+            h_x[index] = startX + j * dx;
+            h_y[index] = y * yScale;
+
+            h_vx[index] = velXDist(rng);
+            h_vy[index] = velYDist(rng);
+
+            h_radius[index] = radiusDist(rng);
+            h_mass[index] = h_radius[index] * h_radius[index];
+
+            h_r[index] = colorDist(rng);
+            h_g[index] = colorDist(rng);
+            h_b[index] = colorDist(rng);
+
+            ++index;
+        }
     }
 
-    glBufferSubData(GL_ARRAY_BUFFER, 0,
-                    NUM_PARTICLES * sizeof(Particle), h_particles);
-    delete[] h_particles;
+    // --- Upload to device ---
+    const size_t size = NUM_PARTICLES * sizeof(float);
+    cudaMemcpy(d_particles.x, h_x.data(), size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_particles.y, h_y.data(), size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_particles.vx, h_vx.data(), size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_particles.vy, h_vy.data(), size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_particles.r, h_r.data(), size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_particles.g, h_g.data(), size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_particles.b, h_b.data(), size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_particles.radius, h_radius.data(), size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_particles.mass, h_mass.data(), size, cudaMemcpyHostToDevice);
 }
-

@@ -1,20 +1,10 @@
 #include "renderer.h"
 #include <cstdio>
 #include <GL/glew.h>
-
-static void framebuffer_size_callback(GLFWwindow *window, int width, int height)
-{
-    glViewport(0, 0, width, height);
-
-    Renderer *renderer =
-        static_cast<Renderer *>(glfwGetWindowUserPointer(window));
-
-    if (renderer)
-        renderer->updateProjection(width, height);
-}
+#include <GLFW/glfw3.h>
 
 // Vertex shader
-const char *vertexShaderSource = R"(
+const char* vertexShaderSource = R"(
 #version 330 core
 layout (location = 0) in vec2 aPos;
 layout (location = 1) in vec3 aColor;
@@ -31,7 +21,7 @@ void main() {
 )";
 
 // Fragment shader
-const char *fragmentShaderSource = R"(
+const char* fragmentShaderSource = R"(
 #version 330 core
 in vec3 color;
 out vec4 FragColor;
@@ -44,16 +34,14 @@ void main() {
 }
 )";
 
-static unsigned int compileShader(unsigned int type, const char *source)
-{
+static unsigned int compileShader(unsigned int type, const char* source) {
     unsigned int shader = glCreateShader(type);
     glShaderSource(shader, 1, &source, NULL);
     glCompileShader(shader);
-
+    
     int success;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
-    if (!success)
-    {
+    if (!success) {
         char log[512];
         glGetShaderInfoLog(shader, 512, NULL, log);
         printf("Shader compilation failed: %s\n", log);
@@ -61,111 +49,149 @@ static unsigned int compileShader(unsigned int type, const char *source)
     return shader;
 }
 
-Renderer::Renderer()
-    : window(nullptr), vao(0), vbo(0), shaderProgram(0)
-{
+Renderer::Renderer() 
+    : window(nullptr), vao(0), vbo(0), shaderProgram(0),
+      windowWidth(INITIAL_WINDOW_WIDTH), windowHeight(INITIAL_WINDOW_HEIGHT) {
 }
 
-Renderer::~Renderer()
-{
+Renderer::~Renderer() {
     shutdown();
 }
 
-bool Renderer::initialize(int width, int height, const char *title)
-{
+void Renderer::framebufferSizeCallback(GLFWwindow* window, int width, int height) {
+    // Get renderer instance from window user pointer
+    Renderer* renderer = (Renderer*)glfwGetWindowUserPointer(window);
+    if (renderer) {
+        renderer->windowWidth = width;
+        renderer->windowHeight = height;
+        renderer->updateProjectionMatrix(width, height);
+    }
+}
+
+void Renderer::updateProjectionMatrix(int width, int height) {
+    glViewport(0, 0, width, height);
+    
+    // Update projection matrix
+    float projection[16] = {
+        2.0f/width, 0, 0, 0,
+        0, -2.0f/height, 0, 0,
+        0, 0, 1, 0,
+        -1, 1, 0, 1
+    };
+    
+    glUseProgram(shaderProgram);
+    int projLoc = glGetUniformLocation(shaderProgram, "projection");
+    glUniformMatrix4fv(projLoc, 1, GL_FALSE, projection);
+}
+
+bool Renderer::initialize(int width, int height, const char* title) {
+    windowWidth = width;
+    windowHeight = height;
+    
     // Initialize GLFW
-    if (!glfwInit())
-    {
+    if (!glfwInit()) {
         printf("Failed to initialize GLFW\n");
         return false;
     }
-
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+    glfwWindowHint(GLFW_RESIZABLE, GL_TRUE);
+    
     window = glfwCreateWindow(width, height, title, NULL, NULL);
-    if (!window)
-    {
+    if (!window) {
         printf("Failed to create window\n");
         glfwTerminate();
         return false;
     }
+    
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1);
-
-    glewExperimental = GL_TRUE;
-    glewInit();
-    while (glGetError() != GL_NO_ERROR)
-        ;
-
+    glfwSwapInterval(1); // Enable vsync
+    
+    // Initialize GLEW (must be after context creation)
+    glewExperimental = GL_TRUE; // Needed for core profile
+    GLenum err = glewInit();
+    if (err != GLEW_OK) {
+        printf("Failed to initialize GLEW: %s\n", glewGetErrorString(err));
+        printf("Trying to continue anyway...\n");
+    }
+    
+    // Clear any GLEW initialization errors (common with core profile)
+    while (glGetError() != GL_NO_ERROR);
+    
+    // Verify OpenGL context
+    printf("OpenGL Version: %s\n", glGetString(GL_VERSION));
+    printf("GLSL Version: %s\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
+    
     glEnable(GL_PROGRAM_POINT_SIZE);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-    if (!createShaders())
+    
+    if (!createShaders()) {
         return false;
-
+    }
+    
     setupBuffers();
+    
+    // Set up resize callback
     glfwSetWindowUserPointer(window, this);
-    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+    glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
 
-    int fbWidth, fbHeight;
-    glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
-
-    glViewport(0, 0, fbWidth, fbHeight);
-    updateProjection(fbWidth, fbHeight);
-
-
+    glfwGetFramebufferSize(window, &width, &height);
+    
     return true;
 }
 
-bool Renderer::createShaders()
-{
+bool Renderer::createShaders() {
     unsigned int vertexShader = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
     unsigned int fragmentShader = compileShader(GL_FRAGMENT_SHADER, fragmentShaderSource);
-
+    
     shaderProgram = glCreateProgram();
     glAttachShader(shaderProgram, vertexShader);
     glAttachShader(shaderProgram, fragmentShader);
     glLinkProgram(shaderProgram);
-
+    
     int success;
     glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
-    if (!success)
-    {
+    if (!success) {
         char log[512];
         glGetProgramInfoLog(shaderProgram, 512, NULL, log);
         printf("Shader linking failed: %s\n", log);
         return false;
     }
-
+    
     glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
-    int widthPx, heightPx;
-    glfwGetFramebufferSize(window, &widthPx, &heightPx);
-    updateProjection(widthPx, heightPx);
-
+    
+    // Setup initial projection matrix
+    updateProjectionMatrix(windowWidth, windowHeight);
+    
     return true;
 }
 
-void Renderer::setupBuffers()
-{
-    // Create VBO
+void Renderer::setupBuffers() {
+    // Create VBO (now stores ParticleVertex instead of Particle)
     glGenBuffers(1, &vbo);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, NUM_PARTICLES * sizeof(Particle), NULL, GL_DYNAMIC_DRAW);
-
+    glBufferData(GL_ARRAY_BUFFER, NUM_PARTICLES * sizeof(ParticleVertex), NULL, GL_DYNAMIC_DRAW);
+    
     // Create VAO
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Particle), (void *)0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Particle), (void *)(4 * sizeof(float)));
-    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(Particle), (void *)(7 * sizeof(float)));
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(ParticleVertex), (void*)0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(ParticleVertex), (void*)(2 * sizeof(float)));
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(ParticleVertex), (void*)(5 * sizeof(float)));
     glEnableVertexAttribArray(0);
     glEnableVertexAttribArray(1);
     glEnableVertexAttribArray(2);
+}
+
+void Renderer::getWindowSize(int* width, int* height) {
+    *width = windowWidth;
+    *height = windowHeight;
 }
 
 void Renderer::render()
@@ -198,38 +224,16 @@ void Renderer::render()
     glfwPollEvents();
 }
 
-
-bool Renderer::shouldClose()
-{
+bool Renderer::shouldClose() {
     return glfwWindowShouldClose(window);
 }
 
-void Renderer::shutdown()
-{
-    if (vao)
-        glDeleteVertexArrays(1, &vao);
-    if (vbo)
-        glDeleteBuffers(1, &vbo);
-    if (shaderProgram)
-        glDeleteProgram(shaderProgram);
-    if (window)
-    {
+void Renderer::shutdown() {
+    if (vao) glDeleteVertexArrays(1, &vao);
+    if (vbo) glDeleteBuffers(1, &vbo);
+    if (shaderProgram) glDeleteProgram(shaderProgram);
+    if (window) {
         glfwDestroyWindow(window);
         glfwTerminate();
     }
-}
-
-void Renderer::updateProjection(int fbWidth, int fbHeight)
-{
-    winHeight = fbHeight;
-    winWidth = fbWidth;
-    float projection[16] = {
-        2.0f / fbWidth, 0.0f, 0.0f, 0.0f,
-        0.0f, -2.0f / fbHeight, 0.0f, 0.0f,
-        0.0f, 0.0f, 1.0f, 0.0f,
-        -1.0f, 1.0f, 0.0f, 1.0f};
-
-    glUseProgram(shaderProgram);
-    GLint projLoc = glGetUniformLocation(shaderProgram, "projection");
-    glUniformMatrix4fv(projLoc, 1, GL_FALSE, projection);
 }
