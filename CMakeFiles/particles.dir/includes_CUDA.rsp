@@ -1,0 +1,1 @@
+-I/home/remi/Desktop/GravityBoxCUDA/include -isystem "/usr/local/cuda/targets/x86_64-linux/include"
