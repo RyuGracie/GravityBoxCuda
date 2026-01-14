@@ -145,10 +145,12 @@ The most important aspect which affects the FPS is physic model, as it leads to 
 
 **Elastic Collision Formula:**
 ```
-impulse = 2 × (v₁ - v₂) · n / (m₁ + m₂)
+impulse = DAMPING × 2 × (v₁ - v₂) · n / (m₁ + m₂)
 v₁' = v₁ - impulse × m₂ × n
 v₂' = v₂ + impulse × m₁ × n
 ```
+
+In situtation of many instantenious collisions, average is taken.
 
 **Spatial Grid:**
 - Window divided into uniform cells (size = `MAX_RADIUS × 2.5`)
@@ -172,5 +174,3 @@ MIT License - see [LICENSE](LICENSE) file for details.
 - CUDA interop: [NVIDIA CUDA Samples](https://github.com/NVIDIA/cuda-samples)
 
 ---
-
-**Fill in benchmark tables after testing on your hardware**
