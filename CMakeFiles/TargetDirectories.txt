@@ -1,3 +1,0 @@
-/home/remi/Desktop/GravityBoxCUDA/CMakeFiles/particles.dir
-/home/remi/Desktop/GravityBoxCUDA/CMakeFiles/edit_cache.dir
-/home/remi/Desktop/GravityBoxCUDA/CMakeFiles/rebuild_cache.dir
